@@ -54,27 +54,92 @@ Read screenshots back with the `Read` tool — Claude Code renders PNGs inline.
 
 ## Command reference
 
+Most commands also accept `[--target TAB_ID]` (act on a specific tab) and `[--port N]` (act on a specific session — see Multi-session below).
+
+**Launch / session**
 | Command | Purpose |
 |---|---|
-| `launch [--port 9222] [--headless] [--persist NAME] [--user-data-dir DIR]` | Start Chrome with an isolated profile. Default: windowed + throwaway profile. `--headless` hides the window. `--persist NAME` uses `~/.browser-cdp-profiles/NAME` so cookies/logins survive across launches. |
+| `launch [--port 9222] [--headless] [--persist NAME] [--user-data-dir DIR] [--download-dir DIR]` | Start Chrome with an isolated profile. Default: windowed + throwaway. `--headless` hides the window. `--persist NAME` uses `~/.browser-cdp-profiles/NAME` so cookies/logins survive across launches. `--download-dir` routes downloads there. Chrome binary is autodetected (override with `$BROWSER_CDP_CHROME`). |
 | `launch --attach URL` | Connect to an already-running Chrome (user must have started it with `--remote-debugging-port=N`). Chrome is left alone on `shutdown`. |
-| `status` | Print current state, Chrome PID liveness, and open tabs. |
+| `status [--all]` | Print current session state, Chrome PID liveness, and open tabs. `--all` lists every session. |
+| `shutdown [--port N] [--all]` | Kill the Chrome we launched (or detach if attached). `--all` shuts down every session. Clears state. |
+
+**Tabs / navigation**
+| Command | Purpose |
+|---|---|
 | `new [--url URL]` | Open a new tab. Sets it as the active target. |
 | `list-tabs` | JSON list of all open tabs with `id`, `url`, `title`, `active`. |
-| `navigate URL [--target ID]` | Go to URL in the active tab (or `--target`). |
-| `snapshot [--target ID] [--json]` | Tag all interactive elements with `e-1..e-N`, print a grouped text list (buttons, links, textboxes…). Use before `click`/`type`. |
-| `text [--target ID]` | Visible page text with `<script>/<style>/<noscript>` stripped. |
-| `screenshot [PATH] [--full] [--target ID]` | Capture PNG. Default path: `/tmp/browser-cdp/screenshots/shot-<ts>.png`. `--full` for full-page. |
-| `click REF [--target ID]` | Click the element with the given ref. Refs come from the most recent `snapshot`. |
-| `type REF TEXT [--submit] [--target ID]` | Focus + type. `--submit` presses Enter after. |
-| `press KEY [--target ID]` | Send a raw key (e.g. `Enter`, `Tab`, `Escape`, `ArrowDown`). |
-| `eval "expr"` [--target ID] | Run JS in the page. Bare expressions and async work — the CLI wraps in `async () => (…)`. |
-| `close-tab [--target ID]` | Close a single tab; Chrome keeps running. |
-| `shutdown` | Kill the Chrome we launched (or detach if attached). Clears state. |
+| `navigate URL [--wait UNTIL] [--timeout MS]` | Go to URL (bare hosts get `https://`). `--wait` ∈ `load\|domcontentloaded\|networkidle0\|networkidle2` (default `domcontentloaded`). |
+| `back` / `forward` / `reload [--timeout MS]` | History navigation; waits for `domcontentloaded`, prints `{url,title}`. |
+| `wait [--selector CSS \| --text S \| --url S \| --idle \| --stable [MS] \| --ms N] [--timeout MS]` | Block until a condition holds. `--stable` = DOM settles (MutationObserver); `--idle` = network idle. Default timeout 15s. |
+
+**Reading**
+| Command | Purpose |
+|---|---|
+| `snapshot [--json]` | Tag all interactive elements (incl. inside iframes) with `e-1..e-N`, print a grouped text list. Use before `click`/`type`. |
+| `text` | Visible page text (all frames), `<script>/<style>/<noscript>` stripped. |
+| `screenshot [PATH] [--full] [--ref e-N]` | Capture PNG. Default path: `/tmp/browser-cdp/screenshots/shot-<ts>.png`. `--full` = full-page; `--ref` = just that element. |
+| `logs [--for MS] [--console] [--network] [--errors] [--reload \| --navigate URL]` | Bounded capture of console/network/page-errors for `--for` ms (default 3000), optionally triggering a reload/navigate. Prints JSON. |
+| `eval "expr"` | Run JS via CDP `Runtime.evaluate` — **CSP-safe** (works on strict-CSP sites). Bare expressions + async supported. |
+
+**Interaction** (REF comes from the latest `snapshot`)
+| Command | Purpose |
+|---|---|
+| `click REF [--wait-nav] [--wait-selector CSS] [--wait-text S]` | Click the ref. `--wait-nav` waits for the resulting navigation; `--wait-*` settle on a post-click condition. |
+| `type REF TEXT [--clear] [--submit]` | Focus + type (appends). `--clear` empties the field first; `--submit` presses Enter after. |
+| `clear REF` | Empty a text field / contenteditable (fires `input`+`change`). |
+| `fill REF TEXT` | Overwrite a field's value wholesale (vs. append-y `type`). |
+| `select REF VALUE [VALUE...]` | Choose option(s) in a `<select>`. |
+| `hover REF` | Hover the element (for hover-triggered menus). |
+| `scroll [--ref e-N \| --bottom \| --top \| --by N]` | Scroll to an element, to page top/bottom, or by N px. |
+| `press KEY` | Send a raw key (e.g. `Enter`, `Tab`, `Escape`, `ArrowDown`). |
+| `close-tab` | Close a single tab; Chrome keeps running. |
+
+**Session portability**
+| Command | Purpose |
+|---|---|
+| `cookies dump [PATH]` / `load PATH` / `clear` | Export/import/clear cookies as JSON. Reuse a session without a windowed login. |
+| `pdf [PATH]` | Render the page to PDF. **Headless only** (Chrome limitation). |
+
+## The act → wait → snapshot loop
+
+Refs and page text are only trustworthy *after* the DOM has settled. Never trust a snapshot taken mid-transition:
+
+```bash
+browser-cdp click e-7 --wait-nav     # or: click e-7 ; wait --stable
+browser-cdp wait --stable            # DOM settles (or --selector / --idle / --text)
+browser-cdp snapshot                 # NOW the refs match what's on screen
+```
+
+Use `wait --selector "#results"` when you know what should appear, `wait --idle` for network-driven pages, `wait --stable` as a general "let the DOM settle" fallback.
 
 ## Ref lifetime
 
-Refs live on the current page under `data-browser-cdp-ref="e-N"`. A navigation, reload, or SPA rerender invalidates them. **Always `snapshot` again after any action that could change the DOM.**
+Refs live on the current page under `data-browser-cdp-ref="e-N"`, numbered continuously across the main document **and all iframes** (each iframe's controls get their own `# iframe:` section in the snapshot). A navigation, reload, or SPA rerender invalidates them. **Always `snapshot` again after any action that could change the DOM.** All element commands (`click`, `type`, `clear`, `fill`, `select`, `hover`, `screenshot --ref`, `scroll --ref`) resolve a ref by searching every frame, so iframe'd login/payment/consent widgets work transparently.
+
+## Capturing logs (debugging a broken page)
+
+`logs` is a **bounded, single-shot** capture — it attaches listeners, optionally triggers activity, waits, and dumps `{console, errors, requests}`:
+
+```bash
+browser-cdp logs --network --reload --for 4000   # reload + capture requests for 4s
+browser-cdp logs --console --errors --for 2000    # just console output + page errors
+```
+
+Pass any of `--console`/`--network`/`--errors` to filter (all three if none given).
+
+## Multi-session
+
+Run more than one browser at once by giving each a distinct `--port`. The default session is whichever you last launched/touched; target a specific one with `--port N` on any command.
+
+```bash
+browser-cdp launch --port 9222              # session A
+browser-cdp launch --port 9333 --headless   # session B, independent
+browser-cdp status --all                    # list both
+browser-cdp shutdown --all                  # stop everything
+```
+
+State is per-port under `/tmp/browser-cdp/sessions/<port>.json`; `state.json` tracks the active session.
 
 ## Safety defaults
 
@@ -118,13 +183,16 @@ On the next task in the same profile: `launch --persist <name>` again reuses the
 
 - Anti-bot systems (Cloudflare, Google, DDG captcha) will often flag headless Chrome. Retry windowed.
 - Ref numbering resets on every `snapshot`; don't cache ref values across steps if the DOM changed.
+- `logs` is a bounded snapshot, not a live tail — it only captures during its own `--for` window.
 - Node ≥ 18 required.
 - On Angular / Vue / React apps with custom elements, standard `.click()` sometimes doesn't fire event handlers. Tag the element via `eval` (`el.setAttribute('data-browser-cdp-ref', 'foo')`) then use `browser-cdp click foo` — the CLI uses puppeteer's real mouse click.
-- The CLI's `eval` wraps input in `return (${expr})`, so top-level `const`/`let`/`var` statements don't parse. Use an IIFE: `(() => { const x = ...; return x; })()`.
+- The CLI's `eval` wraps input in `(async () => (${expr}))()`, so top-level `const`/`let`/`var` statements don't parse. Use an IIFE: `(() => { const x = ...; return x; })()`.
+
+**Now handled** (previously limitations): `eval` runs via CDP so strict-CSP pages no longer break it; `snapshot`/`text`/element commands traverse iframes; the Chrome binary is autodetected across Chrome/Chromium/Brave/Edge.
 
 ## Troubleshooting
 
 - **"nothing listening at endpoint"** → prior `launch` state is stale. Run `browser-cdp shutdown` then relaunch.
 - **"ref not found"** → snapshot again. The DOM changed under you.
-- **Chrome not found** → binary path is hardcoded to `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`. Edit `CHROME_BIN` in the driver if different.
-- **Port already in use** → another Chrome or leftover process on 9222. Use `--port 9223` or `pkill -f "remote-debugging-port"`.
+- **Chrome not found** → autodetection checks Chrome/Chromium/Brave/Edge under `/Applications` and `~/Applications`. If your browser is elsewhere, `export BROWSER_CDP_CHROME=/path/to/binary`.
+- **Port already in use** → another Chrome or leftover process on 9222. Use `--port 9223` (a separate session) or `pkill -f "remote-debugging-port"`.
