@@ -1,0 +1,30 @@
+{
+  "name": "browser-cdp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A small CLI that drives Chrome over the DevTools Protocol, designed to let Claude Code (or any script) navigate, screenshot, and interact with web pages.",
+  "keywords": [
+    "chrome",
+    "cdp",
+    "puppeteer",
+    "browser-automation",
+    "claude-code",
+    "agent-tools"
+  ],
+  "author": "Daniel Miller",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/danielemiller/browser-cdp.git"
+  },
+  "bin": {
+    "browser-cdp": "./browser-cdp.mjs"
+  },
+  "main": "./browser-cdp.mjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}
