@@ -20,7 +20,7 @@
 //   navigate URL [--wait UNTIL] [--timeout MS] [--target ID] [--port N]
 //   back | forward | reload [--timeout MS] [--target ID] [--port N]
 //   wait [--selector CSS | --text S | --url S | --idle | --stable [MS] | --ms N] [--timeout MS]
-//   snapshot [--target ID] [--json] [--port N]
+//   snapshot [--target ID] [--json] [--include-hidden] [--port N]
 //   text [--target ID] [--port N]
 //   screenshot [PATH] [--full] [--ref e-N] [--target ID] [--port N]
 //   click REF [--wait-nav] [--wait-selector CSS] [--wait-text S] [--timeout MS] [--target ID]
@@ -32,10 +32,14 @@
 //   scroll [--ref e-N | --bottom | --top | --by N] [--target ID]
 //   press KEY [--target ID]
 //   eval "expr" [--target ID]           (CSP-safe: runs via raw CDP Runtime.evaluate)
+//   exec "SCRIPT" | --file PATH | -   [--target ID]   (multi-statement JS body, CSP-safe)
 //   logs [--for MS] [--console] [--network] [--errors] [--reload | --navigate URL] [--target ID]
+//   intercept [--url-pattern REGEX] [--method M] [--for MS] [--include-response]
+//             [--reload | --navigate URL] [--target ID]
 //   cookies dump [PATH] | load PATH | clear [--target ID]
 //   pdf [PATH] [--target ID]            (headless only)
 //   close-tab [--target ID]
+//   keepalive [--interval MS] [--stop] [--target ID] [--port N]
 //   shutdown [--port N] [--all]
 //
 // Refs come from `snapshot` — each interactive element (including those inside
@@ -477,7 +481,7 @@ async function cmdWait(args) {
 // Injected per-frame: number every interactive element (continuing from
 // `startAt` so refs are unique across frames), return summary + next counter.
 function collectInFrame(startAt) {
-  const sel = 'a[href], button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [role="menuitem"], [contenteditable="true"]';
+  const sel = 'a[href], button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [role="menuitem"], [role="option"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="tab"], [role="treeitem"], [role="switch"], [role="radio"], [aria-haspopup], [aria-expanded], [contenteditable="true"]';
   const els = Array.from(document.querySelectorAll(sel));
   const isVisible = (el) => {
     const rect = el.getBoundingClientRect();
@@ -538,7 +542,7 @@ function renderControlGroup(lines, controls) {
     if (!buckets.has(c.role)) buckets.set(c.role, []);
     buckets.get(c.role).push(c);
   }
-  const order = ['textbox', 'combobox', 'checkbox', 'button', 'link', 'menuitem', 'generic'];
+  const order = ['textbox', 'combobox', 'checkbox', 'radio', 'switch', 'button', 'link', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem', 'generic'];
   const roles = [...order.filter((r) => buckets.has(r)), ...[...buckets.keys()].filter((r) => !order.includes(r))];
   for (const role of roles) {
     const arr = buckets.get(role);
@@ -553,12 +557,14 @@ function renderControlGroup(lines, controls) {
   }
 }
 
-function renderSnapshot(snap) {
+function renderSnapshot(snap, opts = {}) {
   const lines = [];
   lines.push(`# ${snap.title}`);
   lines.push(`${snap.url}`);
   lines.push('');
-  const visible = snap.controls.filter((c) => c.visible && !c.disabled);
+  const visible = opts.includeHidden
+    ? snap.controls.filter((c) => !c.disabled)
+    : snap.controls.filter((c) => c.visible && !c.disabled);
   const main = visible.filter((c) => c.isMain);
   renderControlGroup(lines, main);
   // Group iframe controls by their frame URL.
@@ -584,8 +590,9 @@ async function cmdSnapshot(args) {
     const page = await pickTarget(browser, args.flags.target, state);
     saveState({ ...state, activeTargetId: targetIdOf(page) });
     const snap = await indexAndCollect(page);
+    const includeHidden = truthy(args.flags['include-hidden']);
     if (args.flags.json) console.log(JSON.stringify(snap, null, 2));
-    else console.log(renderSnapshot(snap));
+    else console.log(renderSnapshot(snap, { includeHidden }));
   } finally { await browser.disconnect(); }
 }
 
@@ -818,6 +825,53 @@ async function cmdEval(args) {
   } finally { await browser.disconnect(); }
 }
 
+async function cmdExec(args) {
+  // SCRIPT source: --file PATH | positional `-` for stdin | positional literal.
+  let script;
+  if (typeof args.flags.file === 'string') {
+    try { script = fs.readFileSync(args.flags.file, 'utf8'); }
+    catch (e) { die(`cannot read --file ${args.flags.file}: ${e.message}`); }
+  } else if (args._[1] === '-') {
+    script = await new Promise((resolve, reject) => {
+      let data = '';
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', (chunk) => { data += chunk; });
+      process.stdin.on('end', () => resolve(data));
+      process.stdin.on('error', reject);
+    });
+  } else {
+    script = args._[1];
+  }
+  if (!script) die('usage: exec "SCRIPT" | exec --file PATH | exec -   [--target ID]');
+  const state = resolveState(args);
+  const browser = await connect(state);
+  try {
+    const page = await pickTarget(browser, args.flags.target, state);
+    // Wrap SCRIPT as an async FUNCTION BODY (not an expression like `eval` does),
+    // so top-level const/let/var + explicit `return` work without a hand-written IIFE.
+    // Raw CDP Runtime.evaluate runs in the inspector context, bypassing the page's
+    // `unsafe-eval` CSP (unlike page.evaluate(new Function)).
+    const client = await page.createCDPSession();
+    try {
+      await client.send('Runtime.enable').catch(() => {});
+      const { result, exceptionDetails } = await client.send('Runtime.evaluate', {
+        expression: `(async () => { ${script} })()`,
+        awaitPromise: true,
+        returnByValue: true,
+        userGesture: true,
+        includeCommandLineAPI: true,
+      });
+      if (exceptionDetails) {
+        die(exceptionDetails.exception?.description || exceptionDetails.text || 'exec error');
+      }
+      if (result.type === 'undefined') { console.log('undefined'); return; }
+      const v = 'value' in result ? result.value : undefined;
+      if (v === undefined) { console.log(result.description || `(non-serializable ${result.subtype || result.type})`); return; }
+      console.log(typeof v === 'string' ? v : JSON.stringify(v, null, 2));
+    } finally { await client.detach().catch(() => {}); }
+  } finally { await browser.disconnect(); }
+}
+
 async function cmdLogs(args) {
   const state = resolveState(args);
   const f = args.flags;
@@ -856,6 +910,90 @@ async function cmdLogs(args) {
     if (inc('errors')) out.errors = errors;
     if (inc('network')) out.requests = requests;
     console.log(JSON.stringify(out, null, 2));
+  } finally { await browser.disconnect(); }
+}
+
+async function cmdIntercept(args) {
+  const state = resolveState(args);
+  const f = args.flags;
+  if (typeof f.navigate === 'string' && f.reload) die('use either --reload or --navigate, not both');
+  const forMs = Number(f.for) || 3000;
+  const pattern = typeof f['url-pattern'] === 'string' ? f['url-pattern'] : '.*';
+  const methodFilter = typeof f.method === 'string' ? f.method.toUpperCase() : null;
+  const includeResponse = !!f['include-response'];
+  const MAX_REQUESTS = 200;
+  const MAX_BODY_BYTES = 200 * 1024;
+  let re;
+  try { re = new RegExp(pattern); }
+  catch (e) { die(`bad --url-pattern regex: ${e.message}`); }
+  const browser = await connect(state);
+  try {
+    const page = await pickTarget(browser, f.target, state);
+    const requests = [];
+    const byReq = new Map();
+    const pending = new Set();
+    let total = 0;
+    let matched = 0;
+    const matchesFilter = (r) => {
+      if (methodFilter && r.method().toUpperCase() !== methodFilter) return false;
+      return re.test(r.url());
+    };
+    const onReq = (r) => {
+      total += 1;
+      if (!matchesFilter(r)) return;
+      matched += 1;
+      if (requests.length >= MAX_REQUESTS) return;
+      const rec = {
+        method: r.method(),
+        url: r.url(),
+        resourceType: r.resourceType(),
+        headers: r.headers(),
+        postData: r.postData() || null,
+      };
+      byReq.set(r, rec);
+      requests.push(rec);
+    };
+    const onResp = (resp) => {
+      const rec = byReq.get(resp.request());
+      if (!rec) return;
+      rec.status = resp.status();
+      rec.statusText = resp.statusText();
+      rec.ok = resp.ok();
+      if (!includeResponse) return;
+      rec.responseHeaders = resp.headers();
+      const task = (async () => {
+        try {
+          const buf = await resp.buffer();
+          const size = buf.length;
+          const truncated = size > MAX_BODY_BYTES;
+          const slice = truncated ? buf.slice(0, MAX_BODY_BYTES) : buf;
+          rec.responseBody = slice.toString('utf8');
+          rec.responseBodyBytes = size;
+          if (truncated) rec.responseBodyTruncated = true;
+        } catch (e) {
+          rec.responseBodyError = String(e.message || e);
+        }
+      })();
+      pending.add(task);
+      task.finally(() => pending.delete(task));
+    };
+    const onFail = (r) => {
+      const rec = byReq.get(r);
+      if (!rec) return;
+      rec.failure = r.failure()?.errorText || 'failed';
+      rec.ok = false;
+    };
+    page.on('request', onReq);
+    page.on('response', onResp);
+    page.on('requestfailed', onFail);
+    if (typeof f.navigate === 'string') await page.goto(normalizeUrl(f.navigate), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    else if (f.reload) await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    await sleep(forMs);
+    page.off('request', onReq);
+    page.off('response', onResp);
+    page.off('requestfailed', onFail);
+    if (pending.size) await Promise.all([...pending]).catch(() => {});
+    console.log(JSON.stringify({ url: page.url(), matched, total, requests }, null, 2));
   } finally { await browser.disconnect(); }
 }
 
@@ -922,11 +1060,87 @@ async function cmdCloseTab(args) {
   } finally { await browser.disconnect(); }
 }
 
+async function cmdKeepalive(args) {
+  const state = resolveState(args);
+  if (!state) die('no state — run `browser-cdp launch` first');
+  const existing = state.keepalive;
+  const killExisting = () => {
+    if (existing && existing.pid) {
+      try { process.kill(existing.pid, 'SIGTERM'); } catch {}
+      return existing.pid;
+    }
+    return null;
+  };
+  if (args.flags.stop) {
+    const pid = killExisting();
+    saveState({ ...state, keepalive: null });
+    console.log(JSON.stringify({ stopped: !!pid, pid: pid || null }, null, 2));
+    return;
+  }
+  killExisting();
+  // Defensive: bare `--interval` sets the flag to boolean true; Number(true)===1
+  // would give a 1ms tick loop. Only accept a numeric string.
+  const rawInterval = args.flags.interval;
+  const intervalMs = (typeof rawInterval === 'string' && Number(rawInterval) > 0) ? Number(rawInterval) : 20000;
+  const targetId = (typeof args.flags.target === 'string' && args.flags.target) || state.activeTargetId || '';
+  const scriptPath = fileURLToPath(import.meta.url);
+  const child = spawn(
+    process.execPath,
+    [scriptPath, '__keepalive-child', state.endpoint, String(intervalMs), targetId],
+    { detached: true, stdio: 'ignore' },
+  );
+  child.unref();
+  saveState({ ...state, keepalive: { pid: child.pid, intervalMs, targetId: targetId || null } });
+  console.log(JSON.stringify({
+    keepalive: { pid: child.pid, intervalMs, endpoint: state.endpoint, targetId: targetId || null },
+  }, null, 2));
+}
+
+// Hidden subcommand: the detached loop spawned by cmdKeepalive. Runs until it
+// receives SIGTERM, the browser disconnects, or a tick fails — then exits 0.
+async function cmdKeepaliveChild(args) {
+  const endpoint = args._[1];
+  const intervalMs = Number(args._[2]) || 20000;
+  const targetId = args._[3] || null;
+  if (!endpoint) process.exit(0);
+  let browser;
+  try {
+    const opts = normalizeEndpoint(endpoint);
+    if (!opts) process.exit(0);
+    browser = await puppeteer.connect({ ...opts, defaultViewport: null });
+  } catch { process.exit(0); }
+  browser.on('disconnected', () => process.exit(0));
+  const tick = async () => {
+    try {
+      const pages = await browser.pages();
+      let page = null;
+      if (targetId) {
+        for (const p of pages) if (targetIdOf(p) === targetId) { page = p; break; }
+      }
+      if (!page) page = pages[pages.length - 1];
+      if (!page) return;
+      const client = await page.createCDPSession();
+      try {
+        // Two small moves per tick — some idle detectors ignore a stationary
+        // coordinate. Raw CDP so page CSP can't block it.
+        await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 10, y: 10 });
+        await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 12, y: 12 });
+      } finally { await client.detach().catch(() => {}); }
+    } catch {
+      try { await browser.disconnect(); } catch {}
+      process.exit(0);
+    }
+  };
+  setInterval(tick, intervalMs);
+  await tick();
+}
+
 async function cmdShutdown(args) {
   if (args.flags.all) {
     const sessions = listSessions();
     const killed = [];
     for (const s of sessions) {
+      if (s.keepalive && s.keepalive.pid) { try { process.kill(s.keepalive.pid, 'SIGTERM'); } catch {} }
       if (s.chromePid && !s.attached) { try { process.kill(s.chromePid, 'SIGTERM'); } catch {} }
       if (s.port) { try { fs.unlinkSync(sessionFile(s.port)); } catch {} }
       killed.push(s.port || s.endpoint);
@@ -938,6 +1152,7 @@ async function cmdShutdown(args) {
   const port = args.flags.port ? Number(args.flags.port) : null;
   const state = resolveState(args);
   if (!state) { console.log('not launched'); return; }
+  if (state.keepalive && state.keepalive.pid) { try { process.kill(state.keepalive.pid, 'SIGTERM'); } catch {} }
   if (state.attached) {
     clearState(port);
     console.log('detached from attached endpoint (Chrome left running)');
@@ -969,11 +1184,17 @@ Tabs / navigation:
   browser-cdp wait [--selector CSS | --text S | --url S | --idle | --stable [MS] | --ms N] [--timeout MS]
 
 Reading:
-  browser-cdp snapshot [--json]          tag interactive elements e-1..e-N (incl. iframes)
+  browser-cdp snapshot [--json] [--include-hidden]
+                                          tag interactive elements e-1..e-N (incl. iframes;
+                                          --include-hidden surfaces controls with zero-size rects,
+                                          useful for popups/portals mid-animation)
   browser-cdp text                        visible page text (all frames)
   browser-cdp screenshot [PATH] [--full] [--ref e-N]
   browser-cdp logs [--for MS] [--console] [--network] [--errors] [--reload | --navigate URL]
+  browser-cdp intercept [--url-pattern REGEX] [--method M] [--for MS] [--include-response] [--reload | --navigate URL]
+      capture matching request bodies (and responses with --include-response, truncated at 200KB)
   browser-cdp eval "expr"                 run JS via CDP (CSP-safe)
+  browser-cdp exec "SCRIPT" | --file PATH | -   multi-statement JS body (CSP-safe)
 
 Interaction (REF comes from the latest snapshot):
   browser-cdp click REF [--wait-nav] [--wait-selector CSS] [--wait-text S]
@@ -990,6 +1211,16 @@ Session portability:
   browser-cdp cookies dump [PATH] | load PATH | clear
   browser-cdp pdf [PATH]                  headless only
 
+Anti-idle:
+  browser-cdp keepalive [--interval MS] [--target ID]
+      Spawn a detached background process that dispatches a synthetic mousemove
+      via CDP every --interval MS (default 20000). Useful for web apps (e.g.
+      Celonis Studio) that auto-save / drop edit mode on idle. Re-running while
+      one is active kills the old one and starts fresh.
+  browser-cdp keepalive --stop
+      Terminate the background keepalive for this session. Idempotent — safe
+      to call when nothing is running. shutdown also stops it automatically.
+
 Global: most commands accept [--target TAB_ID] and [--port N].
 `;
 
@@ -998,9 +1229,10 @@ const HANDLERS = {
   new: cmdNew, 'list-tabs': cmdListTabs, navigate: cmdNavigate,
   back: makeHistoryCmd('back'), forward: makeHistoryCmd('forward'), reload: makeHistoryCmd('reload'),
   wait: cmdWait, snapshot: cmdSnapshot, text: cmdText, screenshot: cmdScreenshot,
-  logs: cmdLogs, eval: cmdEval, click: cmdClick, type: cmdType, clear: cmdClear,
+  logs: cmdLogs, intercept: cmdIntercept, eval: cmdEval, exec: cmdExec, click: cmdClick, type: cmdType, clear: cmdClear,
   fill: cmdFill, select: cmdSelect, hover: cmdHover, scroll: cmdScroll, press: cmdPress,
   cookies: cmdCookies, pdf: cmdPdf, 'close-tab': cmdCloseTab,
+  keepalive: cmdKeepalive, '__keepalive-child': cmdKeepaliveChild,
 };
 
 async function main() {

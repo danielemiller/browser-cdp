@@ -71,9 +71,27 @@ check('resolveChrome returns an existing $BROWSER_CDP_CHROME path', () => {
 check('all documented commands are wired into the dispatch table', () => {
   const expected = ['launch', 'status', 'shutdown', 'new', 'list-tabs', 'navigate',
     'back', 'forward', 'reload', 'wait', 'snapshot', 'text', 'screenshot', 'logs',
-    'eval', 'click', 'type', 'clear', 'fill', 'select', 'hover', 'scroll', 'press',
-    'cookies', 'pdf', 'close-tab'];
+    'intercept', 'eval', 'exec', 'click', 'type', 'clear', 'fill', 'select', 'hover',
+    'scroll', 'press', 'cookies', 'pdf', 'close-tab', 'keepalive'];
   for (const c of expected) assert.ok(typeof mod.HANDLERS[c] === 'function', `missing handler: ${c}`);
+});
+
+check('__keepalive-child is registered so the detached loop can dispatch', () => {
+  assert.ok(typeof mod.HANDLERS['__keepalive-child'] === 'function');
+});
+
+check('renderSnapshot honors opts.includeHidden', () => {
+  const snap = {
+    url: 'https://x.io', title: 'X',
+    controls: [
+      { ref: 'e-1', role: 'button', name: 'Visible', visible: true,  disabled: false, isMain: true, frameUrl: 'https://x.io' },
+      { ref: 'e-2', role: 'button', name: 'Hidden',  visible: false, disabled: false, isMain: true, frameUrl: 'https://x.io' },
+    ],
+  };
+  const off = mod.renderSnapshot(snap);
+  const on  = mod.renderSnapshot(snap, { includeHidden: true });
+  assert.ok(off.includes('Visible') && !off.includes('Hidden'));
+  assert.ok(on.includes('Visible') && on.includes('Hidden'));
 });
 
 check('renderSnapshot groups main-frame and iframe controls', () => {

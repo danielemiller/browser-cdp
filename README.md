@@ -63,11 +63,13 @@ Most commands also accept `[--target TAB_ID]` (act on a specific tab) and `[--po
 
 | Command | Purpose |
 |---|---|
-| `snapshot [--json]` | Tag interactive elements (including inside iframes) with `e-1..e-N`, print a grouped text list (buttons, links, textboxes…). Use before `click`/`type`. |
+| `snapshot [--json] [--include-hidden]` | Tag interactive elements (main frame + iframes + popup/portal roles like `option`/`tab`/`treeitem`) with `e-1..e-N`, print a grouped text list. `--include-hidden` surfaces controls with zero-size rects (popups mid-animation). Use before `click`/`type`. |
 | `text` | Visible page text (all frames) with `<script>/<style>/<noscript>` stripped. |
 | `screenshot [PATH] [--full] [--ref e-N]` | Capture PNG. Default path: `/tmp/browser-cdp/screenshots/shot-<ts>.png`. `--full` for full-page; `--ref` for a single element. |
 | `logs [--for MS] [--console] [--network] [--errors] [--reload \| --navigate URL]` | Bounded capture of console/network/page-errors for `--for` ms (default 3000), optionally triggering a reload/navigate. Prints JSON. |
-| `eval "expr"` | Run JS via CDP `Runtime.evaluate` — **CSP-safe** (works on strict-CSP sites). Bare expressions and async work; the CLI wraps in `async () => (…)`. Use an IIFE `(() => { const x = …; return x })()` for multi-statement code. |
+| `intercept [--url-pattern REGEX] [--method M] [--for MS] [--include-response] [--reload \| --navigate URL]` | Capture request bodies (and response bodies with `--include-response`, truncated at 200KB) for requests matching the pattern. First-class replacement for hand-hooking `XMLHttpRequest.prototype.send`. |
+| `eval "expr"` | Run JS via CDP `Runtime.evaluate` — **CSP-safe**. Single expression; the CLI wraps in `async () => (…)`. For multi-statement code, prefer `exec`. |
+| `exec "SCRIPT" \| --file PATH \| -` | Run multi-statement JS as an async function body — top-level `const`/`let`/`var` + explicit `return` work, no IIFE needed. Also CSP-safe (same CDP path as `eval`). Read from stdin with `-` or a file with `--file PATH`. |
 
 ### Interaction (REF comes from the latest `snapshot`)
 
@@ -89,6 +91,13 @@ Most commands also accept `[--target TAB_ID]` (act on a specific tab) and `[--po
 |---|---|
 | `cookies dump [PATH]` / `load PATH` / `clear` | Export/import/clear cookies as JSON. Reuse a session without a windowed login. |
 | `pdf [PATH]` | Render the page to PDF. **Headless only** (Chrome limitation). |
+
+### Anti-idle
+
+| Command | Purpose |
+|---|---|
+| `keepalive [--interval MS] [--target ID]` | Spawn a detached background process that dispatches a synthetic mousemove via CDP every `--interval` ms (default 20000). Prevents idle-timeout auto-save on web apps that drop out of edit mode after ~60–90s of inactivity (Celonis Studio, some Salesforce record pages, etc.). Re-running while one is active kills the old one first. |
+| `keepalive --stop` | Terminate the background keepalive for this session. Idempotent. `shutdown` also stops it automatically. |
 
 ## Snapshot + ref pattern
 
@@ -142,6 +151,56 @@ browser-cdp logs --console --errors --for 2000    # just console output + page e
 
 Requests include method, url, status, and failure text. Pass any of `--console`/`--network`/`--errors` to filter (all three if none given).
 
+## Reverse-engineering an API: `intercept`
+
+`intercept` is the sibling of `logs` for capturing **request and response bodies** (not just metadata). Useful for figuring out what a web app's UI actually sends to its backend when you click a button — the pattern you'd otherwise implement by hand-hooking `XMLHttpRequest.prototype.send` via `eval`.
+
+```bash
+# What does the "Save" button on this dashboard actually POST?
+browser-cdp intercept --url-pattern "api/v2/boards" --include-response --for 4000 &
+sleep 1 && browser-cdp click e-12          # click Save in another shell
+```
+
+- `--url-pattern` is a JavaScript regex (bare `.*` by default).
+- `--method GET/POST/PUT/…` filters by verb.
+- `--include-response` also fetches response bodies (200 KB cap; `responseBodyBytes` reports the pre-truncation size).
+- `--reload` / `--navigate URL` triggers activity from the intercept command itself.
+- Caps at 200 matched requests; `matched > requests.length` tells you the cap was hit.
+
+## Multi-statement scripts: `exec`
+
+`eval` treats input as a single expression — good for reads, awkward for multi-statement code. `exec` treats input as an async function body: top-level `const`/`let`/`var` and explicit `return` all work directly.
+
+```bash
+browser-cdp exec 'const rows = document.querySelectorAll("tr"); return {count: rows.length, first: rows[0]?.innerText}'
+
+# Read from a file
+browser-cdp exec --file scripts/extract-table.js
+
+# Read from stdin (heredoc)
+browser-cdp exec - <<'JS'
+const editor = monaco.editor.getModels()[0];
+const yaml = editor.getValue();
+const parsed = yaml.split('\n').filter(l => l.startsWith('key:'));
+return parsed;
+JS
+```
+
+Both `eval` and `exec` run via raw CDP `Runtime.evaluate` — CSP-safe on sites that block `unsafe-eval`.
+
+## Preventing idle-timeout auto-save: `keepalive`
+
+Some web apps (Celonis Studio's edit mode is the canonical example, but Salesforce record edits and various admin consoles do the same thing) auto-save and drop you out of edit mode after ~60–90s of inactivity. When you're driving that app from a script with multi-second gaps between commands, the app's idle timer fires and undoes your session.
+
+```bash
+browser-cdp keepalive                       # default: mousemove every 20s
+browser-cdp keepalive --interval 10000      # every 10s
+# ... do your driving work ...
+browser-cdp keepalive --stop                # explicit stop (shutdown also stops it)
+```
+
+`keepalive` spawns a detached background node process that dispatches a synthetic `mousemove` via CDP `Input.dispatchMouseEvent` on the interval. It survives tab-close (falls back to the most recent tab) and disconnects cleanly if Chrome exits. Only one keepalive per session — re-invoking replaces it. The PID is stored under `state.keepalive.pid` and cleaned up by `shutdown` (both single-session and `--all`).
+
 ## Multiple sessions
 
 Run more than one browser at once by giving each a distinct `--port`. The default session is whichever you last launched or touched; target a specific one with `--port N` on any command.
@@ -185,7 +244,9 @@ The skill instructs future sessions to:
 
 - Anti-bot systems (Cloudflare, Google, DDG captcha) often flag headless Chrome. Retry windowed.
 - Ref numbering resets on every `snapshot` — don't cache refs across DOM changes.
-- `logs` is a bounded snapshot, not a live tail — it only captures during its own `--for` window.
+- `logs` and `intercept` are bounded snapshots, not live tails — they only capture during their own `--for` window.
+- `keepalive`'s synthetic mousemove event may not reset every app's idle timer. Some apps listen only for keyboard events or scroll; for those, use `exec` with a page.evaluate that dispatches the specific event the app expects.
+- `intercept --include-response` may miss bodies for requests whose response was already consumed by the page before the buffer is read (redirects, aborted requests).
 - The CLI's `eval` wraps input in `(async () => (${expr}))()`, so top-level `const`/`let`/`var` statements don't parse. Use an IIFE.
 - On some Angular / Vue / React apps, framework event handlers may not fire on a synthetic click; re-`snapshot` and retry, or drive the element via `eval`.
 

@@ -76,11 +76,13 @@ Most commands also accept `[--target TAB_ID]` (act on a specific tab) and `[--po
 **Reading**
 | Command | Purpose |
 |---|---|
-| `snapshot [--json]` | Tag all interactive elements (incl. inside iframes) with `e-1..e-N`, print a grouped text list. Use before `click`/`type`. |
+| `snapshot [--json] [--include-hidden]` | Tag interactive elements (main frame + iframes + popup/portal roles: `option`, `tab`, `treeitem`, `menuitemcheckbox`, `menuitemradio`, `switch`, `radio`, `[aria-haspopup]`, `[aria-expanded]`) with `e-1..e-N`. `--include-hidden` surfaces controls with zero-size rects (popups mid-animation). Use before `click`/`type`. |
 | `text` | Visible page text (all frames), `<script>/<style>/<noscript>` stripped. |
-| `screenshot [PATH] [--full] [--ref e-N]` | Capture PNG. Default path: `/tmp/browser-cdp/screenshots/shot-<ts>.png`. `--full` = full-page; `--ref` = just that element. |
+| `screenshot [PATH] [--full] [--ref e-N]` | Capture PNG. Default path: `/tmp/browser-cdp/screenshots/shot-<ts>.png`. `--full` = full-page; `--ref` = just that element (cheaper on tokens when reading back). |
 | `logs [--for MS] [--console] [--network] [--errors] [--reload \| --navigate URL]` | Bounded capture of console/network/page-errors for `--for` ms (default 3000), optionally triggering a reload/navigate. Prints JSON. |
-| `eval "expr"` | Run JS via CDP `Runtime.evaluate` — **CSP-safe** (works on strict-CSP sites). Bare expressions + async supported. |
+| `intercept [--url-pattern REGEX] [--method M] [--for MS] [--include-response] [--reload \| --navigate URL]` | Capture request bodies (and response bodies with `--include-response`, 200KB cap) for requests matching the pattern. First-class replacement for hand-hooking `XMLHttpRequest.prototype.send`. |
+| `eval "expr"` | Run JS via CDP `Runtime.evaluate` — **CSP-safe**. Single expression. For multi-statement code, use `exec` instead. |
+| `exec "SCRIPT" \| --file PATH \| -` | Run multi-statement JS as an async function body — top-level `const`/`let`/`var` + explicit `return` work directly, no IIFE needed. Also CSP-safe. Read from `--file PATH` or stdin `-`. |
 
 **Interaction** (REF comes from the latest `snapshot`)
 | Command | Purpose |
@@ -100,6 +102,47 @@ Most commands also accept `[--target TAB_ID]` (act on a specific tab) and `[--po
 |---|---|
 | `cookies dump [PATH]` / `load PATH` / `clear` | Export/import/clear cookies as JSON. Reuse a session without a windowed login. |
 | `pdf [PATH]` | Render the page to PDF. **Headless only** (Chrome limitation). |
+
+**Anti-idle**
+| Command | Purpose |
+|---|---|
+| `keepalive [--interval MS] [--target ID]` | Spawn a detached background process that dispatches a synthetic mousemove via CDP every `--interval` ms (default 20000). Prevents idle-timeout auto-save on web apps that drop out of edit mode after ~60–90s of inactivity (Celonis Studio, some Salesforce record edits, various admin consoles). Re-running while one is active replaces it. |
+| `keepalive --stop` | Terminate the background keepalive for this session. Idempotent. `shutdown` also stops it automatically. |
+
+**When to reach for keepalive:** the moment the user says "I want to edit X" in a webapp AND you plan to drive multi-step edits with pauses (screenshot → think → click), start a keepalive first. If in doubt, ask: *"This site sometimes auto-saves on idle — should I run `keepalive` in the background so we don't lose the edit session?"*
+
+## Reverse-engineering an unknown API with `intercept`
+
+If a UI action calls an internal API and you want to know the exact endpoint + payload (e.g., to eventually replay it via `fetch` for a batch operation), `intercept` captures request bodies without hand-hooking XHR:
+
+```bash
+# In background: capture 5s of API traffic while you click Save
+browser-cdp intercept --url-pattern "api/v2" --include-response --for 5000
+# In parallel shell:
+browser-cdp click e-42                   # click the Save button
+```
+
+The pattern is a JS regex; results include method, URL, request headers, `postData` (request body string), status, and (with `--include-response`) response body up to 200KB. Match `matched > requests.length` — that means you hit the 200-request cap.
+
+## Multi-statement scripting with `exec`
+
+`eval` is single-expression only — good for reads, awkward for anything with intermediate state. `exec` treats input as an async function body: top-level `const`/`let`/`var` and `return` work directly.
+
+```bash
+browser-cdp exec 'const editor = monaco.editor.getModels()[0]; const yaml = editor.getValue(); return {length: yaml.length, first: yaml.split("\n")[0]};'
+
+# From a file
+browser-cdp exec --file scripts/extract-something.js
+
+# From stdin (heredoc — no shell-escaping headaches)
+browser-cdp exec - <<'JS'
+const rows = document.querySelectorAll('table tr');
+const out = [...rows].map(r => r.innerText.split('\t'));
+return out.slice(0, 20);
+JS
+```
+
+Both `eval` and `exec` go through raw CDP `Runtime.evaluate` — CSP-safe on strict-CSP sites (`unsafe-eval` blocked).
 
 ## The act → wait → snapshot loop
 
